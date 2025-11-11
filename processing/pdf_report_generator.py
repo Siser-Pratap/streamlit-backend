@@ -1290,7 +1290,7 @@ async def generate_qualitative_insights(summary_data: List[Dict], charts_data: L
         # Call OpenAI API (config.OPENAI_API_KEY is loaded from .env file)
         logger.info(f"Calling OpenAI API with model: gpt-4o, prompt length: {len(prompt)}")
         response = client.chat.completions.create(
-            model="gpt-4o",
+            model="gpt-4o-mini",
             messages=[
                 {"role": "system", "content": "You are an expert media analyst and business strategist. Provide detailed, actionable insights based on the data provided."},
                 {"role": "user", "content": prompt}

@@ -390,7 +390,7 @@ async def transform_dataframe(df: pd.DataFrame) -> pd.DataFrame:
         raise ProcessingError("Processing complete but no rows matched the criteria.")
 
     # Limit processing to the first 100 rows to keep it short
-    # combined = combined.head().reset_index(drop=True)
+    combined = combined.head(5).reset_index(drop=True)
     
     # Ensure the sentiment column exists
     if "sentiment class" not in combined.columns:

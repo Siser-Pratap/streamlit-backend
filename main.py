@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime
 from io import BytesIO
 from typing import List
@@ -12,10 +13,10 @@ from pydantic import BaseModel
 
 from processing.gentari import ProcessingError, process_file
 from storage import ProcessedArtifact, artifact_store
-from db import get_feedback_collection
-
+from db import create_job, update_job_status, get_job, get_feedback_collection
 from processing.pdfGeneration import generate_pdf_report
 from processing.cloudinary import delete_from_cloudinary
+from concurrent.futures import ThreadPoolExecutor
 
 
 app = FastAPI(title="Rantau Data Processing API")
@@ -39,32 +40,87 @@ class FeedbackRequest(BaseModel):
 feedback_entries: List[FeedbackRequest] = []
 
 
+# ------------------------------
+# Long-running processing logic
+# ------------------------------
+executor = ThreadPoolExecutor(max_workers=3)
+
+async def long_processing_job(job_id: str, file_bytes: bytes, filename: str):
+    try:
+        loop = asyncio.get_running_loop()
+
+        # Run CPU-heavy task in a thread
+        output_filename, content = await loop.run_in_executor(
+            executor, lambda: asyncio.run(process_file(file_bytes, filename))
+        )
+
+        artifact_store.put(
+            ProcessedArtifact(
+                job_id=job_id,
+                filename=output_filename,
+                content=content,
+                created_at=datetime.utcnow(),
+            )
+        )
+
+        await update_job_status(job_id, "completed")
+
+    except Exception as e:
+        await update_job_status(job_id, "failed", str(e))
+
+
+# ------------------------------
+# Routes
+# ------------------------------
+
 @app.post("/process")
 async def process_upload(
     file: UploadFile = File(...),
     language: str = Form(""),
     geography: str = Form(""),
 ):
-    del language, geography  # Retained for frontend compatibility
-
+    """Starts a long-running async processing job."""
     file_bytes = await file.read()
-
-    try:
-        output_filename, content = await process_file(file_bytes, file.filename or "input.xlsx")
-    except ProcessingError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-
     job_id = str(uuid4())
-    artifact_store.put(
-        ProcessedArtifact(
-            job_id=job_id,
-            filename=output_filename,
-            content=content,
-            created_at=datetime.utcnow(),
-        )
-    )
 
-    return {"job_id": job_id, "file_name": output_filename}
+    await create_job(job_id, file.filename)
+
+    # Run in background (non-blocking)
+    asyncio.create_task(long_processing_job(job_id, file_bytes, file.filename))
+
+    return {"job_id": job_id, "message": "Processing started"}
+
+
+@app.get("/status/{job_id}")
+async def get_status(job_id: str):
+    """Check job status from MongoDB."""
+    job = await get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    return job
+
+
+@app.get("/result/{job_id}")
+async def get_result(job_id: str):
+    """Retrieve the processed file after completion."""
+    job = await get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    if job["status"] == "error":
+        raise HTTPException(status_code=502, detail=job.error)
+
+    elif job["status"] != "completed":
+        raise HTTPException(status_code=400, detail="Job not yet completed")
+
+    artifact = artifact_store.get(job_id)
+    if not artifact:
+        raise HTTPException(status_code=404, detail="Artifact not found")
+
+    return {
+        "filename": artifact.filename,
+        "content": artifact.content.decode(errors="ignore"),
+    }
 
 
 @app.get("/download/{job_id}")
@@ -86,16 +142,15 @@ async def download_output(job_id: str, format: str = "excel"):
 
 
 @app.post("/pdf-report/generate")
-async def generate_pdf(file:UploadFile = File(...)):
+async def generate_pdf(file: UploadFile = File(...)):
     """
-    Endpoint to generate a beautiful PDF report from Excel data with OpenAI insights.
-    Supports brand logo, context, and customizable graph types.
+    Endpoint to generate a PDF report from Excel data with insights and charts.
     """
-    reportTitle="Gentari"
-    brandName="Gentari"
-    includeInsights=True
-    includeCharts=True
-    customPrompt=""
+    reportTitle = "Gentari"
+    brandName = "Gentari"
+    includeInsights = True
+    includeCharts = True
+    customPrompt = ""
 
     try:
         result = await generate_pdf_report(file, reportTitle, brandName, includeInsights, includeCharts, customPrompt)
@@ -103,20 +158,18 @@ async def generate_pdf(file:UploadFile = File(...)):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+
 @app.post("/feedback")
 async def submit_feedback(payload: FeedbackRequest):
     entry = payload.dict()
     entry["created_at"] = datetime.utcnow().isoformat()
 
-    # Save in-memory for backward compatibility
     feedback_entries.append(entry)
 
-    # Persist to MongoDB
     try:
         coll = get_feedback_collection()
         await coll.insert_one(entry)
     except Exception:
-        # Ignore persistence failure to not break user flow
         pass
 
     return {"status": "received", "persisted": True}
@@ -124,18 +177,16 @@ async def submit_feedback(payload: FeedbackRequest):
 
 @app.get("/feedback")
 async def get_feedback(limit: int = 100):
-    # Try to fetch from MongoDB, fallback to in-memory list
     try:
         coll = get_feedback_collection()
         cursor = (
-            coll.find({}, {"_id": 0})  # exclude ObjectId for JSON serialization
+            coll.find({}, {"_id": 0})
             .sort("created_at", -1)
             .limit(int(limit))
         )
         results = await cursor.to_list(length=int(limit))
         return results
     except Exception:
-        # Return latest items from in-memory storage if DB unavailable
         return list(reversed(feedback_entries))[-int(limit):]
 
 
@@ -145,13 +196,10 @@ class DeleteChartRequest(BaseModel):
 
 @app.delete("/charts/delete")
 async def delete_charts(payload: DeleteChartRequest):
-    """
-    Delete chart images from Cloudinary.
-    Accepts a list of Cloudinary URLs to delete.
-    """
+    """Delete chart images from Cloudinary."""
     deleted = []
     failed = []
-    
+
     for url in payload.urls:
         try:
             result = delete_from_cloudinary(url)
@@ -161,7 +209,7 @@ async def delete_charts(payload: DeleteChartRequest):
                 failed.append({"url": url, "error": result.get("result", "unknown error")})
         except Exception as e:
             failed.append({"url": url, "error": str(e)})
-    
+
     return {
         "success": len(failed) == 0,
         "deleted": deleted,
